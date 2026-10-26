@@ -102,6 +102,14 @@ impl PlanCache {
     }
 }
 
+/// A grip of a selected floor: a corner, or the middle of an edge (edge `k` runs from corner `k` to
+/// the next).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FloorGrip {
+    Corner(usize),
+    Edge(usize),
+}
+
 pub struct Canvas {
     pub(crate) drawing: PlanCache,
     cams: BTreeMap<Id, Camera>,
@@ -121,6 +129,8 @@ pub struct Canvas {
     crop_drag: Option<(Id, usize)>,
     /// A selected wall's end being dragged: the wall, and whether it's its start.
     grip: Option<(Id, bool)>,
+    /// A selected floor's grip being dragged: the floor, and which corner or edge.
+    floor_grip: Option<(Id, FloorGrip)>,
     /// A selected level's end being dragged in a section or an elevation: the level, and whether
     /// it's its far end.
     level_grip: Option<(Id, bool)>,
@@ -149,6 +159,7 @@ impl Default for Canvas {
             cycle: 0,
             crop_drag: None,
             grip: None,
+            floor_grip: None,
             level_grip: None,
             press: None,
             lifted: None,
@@ -909,11 +920,13 @@ impl BimApp {
         let crop = self.crop_grips(ui, &response, rect, &view, key);
         self.canvas.found.set(None);
         self.grip_drag(ui, &response, rect, &view, level);
+        self.floor_grip_drag(ui, &response, rect, &view, level);
         // A drag from an element moves the selection; from empty floor, it draws a selection box.
         if response.drag_started_by(PointerButton::Primary)
             && self.tool == Tool::Modify
             && self.canvas.crop_drag.is_none()
             && self.canvas.grip.is_none()
+            && self.canvas.floor_grip.is_none()
             && let Some(o) = ui.input(|i| i.pointer.press_origin())
         {
             let o = (o.x - rect.min.x, o.y - rect.min.y);
@@ -1007,6 +1020,7 @@ impl BimApp {
             }
         }
         self.grip_overlay(ui, &model, &view, rect, level, &d);
+        self.floor_grip_overlay(ui, &model, &view, rect, level, &d);
         self.temporary_dimension(ui, &model, &view, rect);
         self.context_menu(&response);
         self.nav_bar(ui, rect, key);
@@ -1995,6 +2009,134 @@ impl BimApp {
         }
         if held.is_none() {
             self.wall_angles(ui, &p, id, w, v, rect);
+        }
+    }
+
+    /// The floor selected alone, with Modify, on plan `level`: the one whose corners and edges are
+    /// grips, and its outline.
+    fn floor_gripped(&self, level: Id) -> Option<(Id, Vec<P2>)> {
+        let m = &self.session.model;
+        match (self.selection.as_slice(), &self.tool) {
+            (&[id], Tool::Modify) => match m.elements.get(id) {
+                Some(Element::Floor(f)) if f.level == m.guid(level) && f.boundary.len() >= 3 => Some((id, f.boundary.clone())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The outline floor `ring` takes for a drag of `grip` to pixel `q`, and what the point snapped
+    /// to: a corner goes to the point, with the guides from its neighbours; an edge moves square to
+    /// itself until it passes through the point, its neighbours stretching to meet it.
+    fn floor_target(
+        &self,
+        m: &Model,
+        level: Id,
+        v: &View,
+        (ring, grip): (&[P2], FloorGrip),
+        q: (f32, f32),
+        mods: Modifiers,
+    ) -> (Found, Vec<P2>) {
+        let n = ring.len().max(1);
+        match grip {
+            FloorGrip::Corner(k) => {
+                let from = [ring[(k + n - 1) % n], ring[(k + 1) % n]];
+                let found = self.snap(m, level, v, q, &from, mods.shift);
+                let ring = geom::move_ring_corner(ring, k, micron(found.at));
+                (found, ring)
+            }
+            FloorGrip::Edge(k) => {
+                // An edge only moves square to itself, so no angle guides from its corners: what's
+                // there to snap to, else the nearest 10 mm.
+                let found = self.snap(m, level, v, q, &[], mods.shift);
+                let ring = geom::move_ring_edge(ring, k, found.at).into_iter().map(micron).collect();
+                (found, ring)
+            }
+        }
+    }
+
+    /// A drag from a grip of the selected floor reshapes it: a corner moves to the cursor, an edge
+    /// moves square to itself; both snap (a corner with the angle guides from its neighbours, an edge to
+    /// what's there or the nearest 10 mm); on release, `modify` with
+    /// the new boundary, one step to undo, and the model refuses an outline it can't build (the
+    /// status says why).
+    fn floor_grip_drag(&mut self, ui: &Ui, response: &Response, rect: Rect, view: &View, level: Id) {
+        let Some((id, ring)) = self.floor_gripped(level) else {
+            self.canvas.floor_grip = None;
+            return;
+        };
+        let at = |p: P2| pos(rect.min, view.px(p));
+        if response.drag_started_by(PointerButton::Primary)
+            && self.canvas.crop_drag.is_none()
+            && let Some(o) = ui.input(|i| i.pointer.press_origin())
+        {
+            let near = |p: P2| at(p).distance(o);
+            let nearest = |pts: &[P2]| {
+                pts.iter().enumerate().filter(|(_, p)| near(**p) <= 8.0).min_by(|a, b| near(*a.1).total_cmp(&near(*b.1))).map(|(k, _)| k)
+            };
+            // A corner wins over the middle of an edge where both are under the press.
+            let grip = nearest(&ring).map(FloorGrip::Corner).or_else(|| nearest(&geom::ring_edge_grips(&ring)).map(FloorGrip::Edge));
+            if let Some(g) = grip {
+                self.canvas.floor_grip = Some((id, g));
+            }
+        }
+        let Some((held, grip)) = self.canvas.floor_grip else { return };
+        if held != id {
+            self.canvas.floor_grip = None;
+            return;
+        }
+        if response.drag_stopped() {
+            self.canvas.floor_grip = None;
+            if !self.canvas.quick()
+                && let Some(q) = ui.input(|i| i.pointer.latest_pos())
+            {
+                let m = std::sync::Arc::clone(&self.session.model);
+                let mods = ui.input(|i| i.modifiers);
+                let (_, shaped) = self.floor_target(&m, level, view, (&ring, grip), (q.x - rect.min.x, q.y - rect.min.y), mods);
+                self.snap_once = None;
+                if shaped != ring {
+                    self.run("modify", json!({"id": id, "boundary": shaped.iter().map(|p| point(*p)).collect::<Vec<_>>()}));
+                }
+            }
+        }
+    }
+
+    /// The selected floor's grips: a square at each corner, a smaller one at the middle of each edge.
+    /// Dragging one, the outline as it would be, and for an edge, how far it has gone.
+    fn floor_grip_overlay(&mut self, ui: &mut Ui, m: &Model, v: &View, rect: Rect, level: Id, d: &Drawing) {
+        let Some((id, ring)) = self.floor_gripped(level) else { return };
+        let p = ui.painter_at(rect);
+        let at = |q: P2| pos(rect.min, v.px(q));
+        let held = self.canvas.floor_grip.filter(|(g, _)| *g == id).map(|(_, g)| g);
+        let mut shown = ring.clone();
+        if let (Some(grip), Some(q)) = (held, ui.input(|i| i.pointer.latest_pos())) {
+            let (mods, q) = (ui.input(|i| i.modifiers), (q.x - rect.min.x, q.y - rect.min.y));
+            let (found, shaped) = self.floor_target(m, level, v, (&ring, grip), q, mods);
+            p.add(Shape::closed_line(shaped.iter().map(|q| at(*q)).collect(), Stroke::new(1.5, pal().accent)));
+            let sc = Scene { p: &p, m, d, level, key: level, v };
+            self.show_snap(&sc, &found);
+            self.canvas.found.set(Some(found));
+            if let FloorGrip::Edge(k) = grip {
+                let n = ring.len();
+                let (a, b) = (ring[k], ring[(k + 1) % n]);
+                // Out is to the right of an edge on a counter-clockwise outline: positive is outward.
+                let out = (b - a).unit().perp() * -geom::area(&ring).signum();
+                let moved = (shaped[k] - a).dot(out);
+                let mid = (shaped[k] + shaped[(k + 1) % n]) * 0.5;
+                let sign = if moved < 0.0 { "−" } else { "+" };
+                tag(&p, at(mid) + vec2(12.0, -12.0), Align2::LEFT_BOTTOM, format!("{sign}{}", m.units.with_unit(moved.abs())));
+            }
+            shown = shaped;
+        }
+        let grip_at = |r: Rect, live: bool| {
+            p.rect_filled(r, 1.0, if live { pal().accent } else { pal().surface });
+            p.rect_stroke(r, 1.0, Stroke::new(1.5, pal().accent), StrokeKind::Middle);
+        };
+        for (k, c) in shown.iter().enumerate() {
+            grip_at(Rect::from_center_size(at(*c), vec2(9.0, 9.0)), held == Some(FloorGrip::Corner(k)));
+        }
+        for (k, g) in geom::ring_edge_grips(&shown).into_iter().enumerate() {
+            grip_at(Rect::from_center_size(at(g), vec2(7.0, 7.0)), held == Some(FloorGrip::Edge(k)));
         }
     }
 

@@ -83,6 +83,14 @@ a shortcut's override: `snap_once`, `Snaps::only`, `Snaps::none`); `found` and
 `show_snap` draw what a pick would land on, and a point that moves with the cursor goes through them. A selected wall's ends are
 grips (`grip_drag`): a drag runs `move` with `end`, Ctrl keeps the length; the angle beside each end runs `rotate` about it. A
 wall joined at the end that moves keeps its joint, which slides along the wall it meets, so lengths change.
+A selected floor, on the plan of its level, has a grip at each corner and a smaller one at the middle of each edge
+(`floor_grip_drag`, `floor_grip_overlay`): a corner goes where the cursor snaps, with the angle guides from its neighbours
+(`geom::move_ring_corner`); an edge, which has no angle guides, moves square
+to itself until it passes through that point and each neighbour keeps its own line, stretching to meet it, so a rectangle stays a
+rectangle (`geom::move_ring_edge`, Revit's drag of a sketch line). While dragging, the outline as it would be and, for an edge, how
+far it has gone (positive outward); on release, `modify` with the new `boundary`, one step to undo, and `Model::check` refuses an
+outline it can't build. A corner wins over an edge's middle where both are under the press; a drag away from the grips moves the
+floor, as before.
 
 A click is made where the button was, not where the hand has got to. egui reads a click's position, and what lay under it, from the
 pointer's last position in the frame, and counts two clicks in a frame as one, so a hand that moves on in the time between frames

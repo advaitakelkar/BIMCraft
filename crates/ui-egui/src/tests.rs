@@ -3293,6 +3293,51 @@ fn a_selected_walls_ends_are_grips_to_drag_and_ctrl_turns_it_about_the_other_end
     assert!(c.1 > a.1 + 400.0 && d.1 > b.1 + 400.0, "{a:?} {b:?} -> {c:?} {d:?}: both ends went up");
 }
 
+/// The boundary of the first floor in the model.
+fn floor_ring(h: &Harness<BimApp>) -> Vec<P2> {
+    match h.state().session.model.elements.iter().find_map(|(_, e)| if let Element::Floor(f) = e { Some(f.boundary.clone()) } else { None })
+    {
+        Some(b) => b,
+        None => panic!("no floor"),
+    }
+}
+
+const TILE: &str = r#"floor {"boundary": [[0,0],[4000,0],[4000,2000],[0,2000]]}"#;
+
+#[test]
+fn a_selected_floors_edges_and_corners_are_grips_to_drag() {
+    let mut h = app(TILE);
+    // A floor is picked by its outline in a plan, as in Revit.
+    click(&mut h, P2(1000.0, 0.0));
+    let floor = find(&h, |e| matches!(e, Element::Floor(_)));
+    assert_eq!(h.state().selection, [floor]);
+    // The east edge, by the grip at its middle, out 600 mm: its two corners go with it, square.
+    drag(&mut h, P2(4000.0, 1000.0), P2(4600.0, 1000.0));
+    assert_eq!(floor_ring(&h), [P2(0.0, 0.0), P2(4600.0, 0.0), P2(4600.0, 2000.0), P2(0.0, 2000.0)]);
+    assert_eq!(h.state().selection, [floor], "still selected, to drag again");
+    // A corner alone.
+    drag(&mut h, P2(0.0, 2000.0), P2(-300.0, 2500.0));
+    assert_eq!(floor_ring(&h), [P2(0.0, 0.0), P2(4600.0, 0.0), P2(4600.0, 2000.0), P2(-300.0, 2500.0)]);
+    // Each drag is one step to undo.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+    h.run();
+    assert_eq!(floor_ring(&h), [P2(0.0, 0.0), P2(4600.0, 0.0), P2(4600.0, 2000.0), P2(0.0, 2000.0)]);
+    // A drag that starts on the outline away from the grips moves the floor, as it did.
+    drag(&mut h, P2(1000.0, 0.0), P2(1000.0, 500.0));
+    assert_eq!(floor_ring(&h)[0], P2(0.0, 500.0));
+}
+
+#[test]
+fn a_flick_from_a_floors_grip_leaves_the_floor_as_it_was() {
+    let mut h = app_at(TILE, 0.05);
+    click(&mut h, P2(1000.0, 0.0));
+    assert_eq!(h.state().selection.len(), 1, "the floor is selected, so its grips are there to flick");
+    let before = Arc::clone(&h.state().session.model);
+    let (grip, off) = (h.state().screen(P2(4000.0, 1000.0)), h.state().screen(P2(4600.0, 1000.0)));
+    flick(&mut h, grip, off, Modifiers::NONE);
+    assert!(Arc::ptr_eq(&before, &h.state().session.model), "the edge did not move");
+}
+
 #[test]
 fn a_selected_walls_angle_is_typed_to_turn_it_about_either_end() {
     let mut h = app(BOX);

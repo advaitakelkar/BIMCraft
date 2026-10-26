@@ -72,6 +72,45 @@ pub fn move_edge([lo, hi]: [P2; 2], k: usize, p: P2) -> [P2; 2] {
     }
 }
 
+/// The middle of each edge of `ring`, edge `k` running from corner `k` to the next: where a floor's
+/// edges are grips.
+pub fn ring_edge_grips(ring: &[P2]) -> Vec<P2> {
+    ring_edges(ring).map(|(a, b)| (a + b) * 0.5).collect()
+}
+
+/// `ring` with corner `k` at `p`; as it was when there is no corner `k`.
+pub fn move_ring_corner(ring: &[P2], k: usize, p: P2) -> Vec<P2> {
+    let mut out = ring.to_vec();
+    if let Some(q) = out.get_mut(k) {
+        *q = p;
+    }
+    out
+}
+
+/// `ring` with edge `k` (from corner `k` to the next) moved square to itself until its line passes
+/// through `p`, as Revit's drag of a sketch line does: each neighbouring edge keeps its own line and
+/// stretches or shrinks to meet it, so a rectangle stays a rectangle; a neighbour parallel to the
+/// edge, which no line meets, is carried along with it. As it was for a ring under three corners, an
+/// edge it doesn't have, or an edge of no length.
+pub fn move_ring_edge(ring: &[P2], k: usize, p: P2) -> Vec<P2> {
+    let n = ring.len();
+    if n < 3 || k >= n {
+        return ring.to_vec();
+    }
+    let (a, b) = (ring[k], ring[(k + 1) % n]);
+    if a.dist(b) <= 0.0 {
+        return ring.to_vec();
+    }
+    let across = (b - a).unit().perp();
+    let by = across * (p - a).dot(across);
+    let (a2, b2) = (a + by, b + by);
+    let (before, after) = (ring[(k + n - 1) % n], ring[(k + 2) % n]);
+    let mut out = ring.to_vec();
+    out[k] = line_intersection(a2, b2, before, a).unwrap_or(a2);
+    out[(k + 1) % n] = line_intersection(a2, b2, b, after).unwrap_or(b2);
+    out
+}
+
 pub fn ring_edges(ring: &[P2]) -> impl Iterator<Item = (P2, P2)> + '_ {
     ring.iter().copied().zip(ring.iter().copied().cycle().skip(1))
 }
@@ -351,6 +390,31 @@ pub fn region_in(all: &[Vec<P2>], p: P2, tol: f64) -> Option<Region> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rings_edge_moves_square_to_itself_and_its_neighbours_stretch_to_meet_it() {
+        let sq = [P2(0.0, 0.0), P2(4000.0, 0.0), P2(4000.0, 2000.0), P2(0.0, 2000.0)];
+        assert_eq!(ring_edge_grips(&sq), vec![P2(2000.0, 0.0), P2(4000.0, 1000.0), P2(2000.0, 2000.0), P2(0.0, 1000.0)]);
+        // The east edge (1) out to x = 4600: only how far the point is across the edge counts.
+        assert_eq!(move_ring_edge(&sq, 1, P2(4600.0, 1700.0)), vec![P2(0.0, 0.0), P2(4600.0, 0.0), P2(4600.0, 2000.0), P2(0.0, 2000.0)]);
+        // The last edge, from the last corner back to the first, in.
+        assert_eq!(move_ring_edge(&sq, 3, P2(250.0, 0.0)), vec![P2(250.0, 0.0), P2(4000.0, 0.0), P2(4000.0, 2000.0), P2(250.0, 2000.0)]);
+        // A slanted neighbour keeps its slant: the corner slides along it.
+        let tr = [P2(0.0, 0.0), P2(4000.0, 0.0), P2(2000.0, 2000.0)];
+        let m = move_ring_edge(&tr, 0, P2(1000.0, -1000.0));
+        let want = [P2(-1000.0, -1000.0), P2(5000.0, -1000.0), P2(2000.0, 2000.0)];
+        assert!(m.iter().zip(want).all(|(a, b)| a.dist(b) < 1e-6), "{m:?}");
+        // Out of range, or a ring too short: as it was.
+        assert_eq!(move_ring_edge(&sq, 9, P2(9.0, 9.0)), sq.to_vec());
+        assert_eq!(move_ring_edge(&sq[..2], 0, P2(9.0, 9.0)), sq[..2].to_vec());
+    }
+
+    #[test]
+    fn a_rings_corner_moves_alone() {
+        let sq = [P2(0.0, 0.0), P2(4000.0, 0.0), P2(4000.0, 2000.0), P2(0.0, 2000.0)];
+        assert_eq!(move_ring_corner(&sq, 2, P2(4300.0, 2500.0)), vec![P2(0.0, 0.0), P2(4000.0, 0.0), P2(4300.0, 2500.0), P2(0.0, 2000.0)]);
+        assert_eq!(move_ring_corner(&sq, 4, P2(1.0, 1.0)), sq.to_vec());
+    }
 
     #[test]
     fn rings_grow_outward_at_every_edge() {
